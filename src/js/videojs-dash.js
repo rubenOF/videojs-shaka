@@ -550,6 +550,10 @@ videojs.DashSourceHandler.canPlayType = function(type) {
   if (dashTypeRE.test(type)) {
     return 'probably';
   }
+  if (/^application\/x-mpegURL/i.test(type)
+    && !!muxjs) {
+    return 'probably';
+  }
 
   return '';
 };
