@@ -1,240 +1,513 @@
 import window from 'global/window';
 import videojs from 'video.js';
-import dashjs from 'dashjs';
-import setupAudioTracks from './setup-audio-tracks';
-import setupTextTracks from './setup-text-tracks';
+import shaka from 'shaka-player';
+import findKeyByValue from './findKeyByValue';
+import shakaDrmConfigFromKeySystemOptions from './shakaDrmConfigFromKeySystemOptions';
 
 /**
  * videojs-contrib-dash
  *
- * Use Dash.js to playback DASH content inside of Video.js via a SourceHandler
+ * Use Shaka Player to playback DASH content inside of Video.js via a SourceHandler
  */
-class Html5DashJS {
-  constructor(source, tech, options) {
-    // Get options from tech if not provided for backwards compatibility
-    options = options || tech.options_;
-
-    this.player = videojs(options.playerId);
-    this.player.dash = this.player.dash || {};
-
-    this.tech_ = tech;
-    this.el_ = tech.el();
-    this.elParent_ = this.el_.parentNode;
-
+class ShakaHandler {
+  constructor(source, tech, options = tech.options_) {
     // Do nothing if the src is falsey
     if (!source.src) {
       return;
     }
 
-    // While the manifest is loading and Dash.js has not finished initializing
-    // we must defer events and functions calls with isReady_ and then `triggerReady`
-    // again later once everything is setup
-    tech.isReady_ = false;
-
-    if (Html5DashJS.updateSourceData) {
-      videojs.log.warn('updateSourceData has been deprecated.' +
-        ' Please switch to using hook("updatesource", callback).');
-      source = Html5DashJS.updateSourceData(source);
-    }
+    const player = videojs(options.playerId);
+    this.player = player;
+    this.el_ = tech.el();
 
     // call updatesource hooks
-    Html5DashJS.hooks('updatesource').forEach((hook) => {
+    ShakaHandler.hooks('updatesource').forEach((hook) => {
       source = hook(source);
     });
 
-    let manifestSource = source.src;
-    this.keySystemOptions_ = Html5DashJS.buildDashJSProtData(source.keySystemOptions);
+    shaka.polyfill.installAll();
 
-    this.player.dash.mediaPlayer = dashjs.MediaPlayer().create();
+    // reuse an existing shaka player
+    const shakaPlayer = (player.dash && player.dash.shakaPlayer) ||
+      new shaka.Player(this.el_);
+    this.shakaPlayer = shakaPlayer;
 
-    this.mediaPlayer_ = this.player.dash.mediaPlayer;
+    player.dash = {
+      shakaPlayer
+    };
 
-    // Log MedaPlayer messages through video.js
-    if (Html5DashJS.useVideoJSDebug) {
-      videojs.log.warn('useVideoJSDebug has been deprecated.' +
-        ' Please switch to using hook("beforeinitialize", callback).');
-      Html5DashJS.useVideoJSDebug(this.mediaPlayer_);
-    }
-
-    if (Html5DashJS.beforeInitialize) {
-      videojs.log.warn('beforeInitialize has been deprecated.' +
-        ' Please switch to using hook("beforeinitialize", callback).');
-      Html5DashJS.beforeInitialize(this.player, this.mediaPlayer_);
-    }
-
-    Html5DashJS.hooks('beforeinitialize').forEach((hook) => {
-      hook(this.player, this.mediaPlayer_);
+    tech.one('dispose', function() {
+      shakaPlayer.destroy();
     });
 
-    // Must run controller before these two lines or else there is no
-    // element to bind to.
-    this.mediaPlayer_.initialize();
+    // reset Shaka Player if it exists
+    shakaPlayer.resetConfiguration();
 
-    // Apply all dash options that are set
-    if (options.dash) {
-      Object.keys(options.dash).forEach((key) => {
-        const dashOptionsKey = 'set' + key.charAt(0).toUpperCase() + key.slice(1);
-        let value = options.dash[key];
+    ShakaHandler.hooks('beforeinitialize').forEach((hook) => {
+      hook(this.player, this.shakaPlayer);
+    });
 
-        if (this.mediaPlayer_.hasOwnProperty(dashOptionsKey)) {
-          // Providing a key without `set` prefix is now deprecated.
-          videojs.log.warn(`Using dash options in videojs-contrib-dash without the set prefix ` +
-            `has been deprecated. Change '${key}' to '${dashOptionsKey}'`);
+    // limit ABR by player size
+    player.on(['fullscreenchange'], () => { this.resize() });
 
-          // Set key so it will still work
-          key = dashOptionsKey;
-        }
+    shakaPlayer.configure({
+      abr: {
+        enabled: true
+        // videojs-contrib-hls's default initial bandwidth
+        // "start playlist selection at a reasonable bandwidth for
+        // broadband internet
+        // 0.5 MB/s"
+        // defaultBandwidthEstimate: 4194304
+      }
+    });
 
-        if (!this.mediaPlayer_.hasOwnProperty(key)) {
-          videojs.log.warn(
-            `Warning: dash configuration option unrecognized: ${key}`
-          );
+    // set up DRM
+    if (source.keySystemOptions) {
+      shakaPlayer.configure(shakaDrmConfigFromKeySystemOptions(source.keySystemOptions));
+    }
+
+    shakaPlayer.addEventListener('error', function(event) {
+      ShakaHandler.onError(event.detail);
+    });
+
+    shakaPlayer.addEventListener('adaptation', function (a) {
+      var playerEL = player.el();
+      var controlBar = playerEL.parentNode.querySelector('.vjs-control-bar');
+      var shakaMenuContent = controlBar.querySelector('.vjs-shaka-button');
+      var selected = shakaMenuContent.querySelector('.vjs-selected');
+      if (selected) {
+        selected.className = selected.className.replace('vjs-selected', '');
+      }
+
+      var active = this.getVariantTracks().filter((track) => track.active === true);
+      var newSelected = shakaMenuContent.querySelector('[data-id="' + active[0].id + '"]');
+      newSelected.className = newSelected.className + " vjs-selected";
+    });
+
+    player.dash.representations = this.setupRepresentations();
+
+    this.load(source.src);
+  }
+
+  static onError(error) {
+    const errorCategory = findKeyByValue(shaka.util.Error.Category, error.category);
+    const errorName = findKeyByValue(shaka.util.Error.Code, error.code);
+
+    videojs.log.error(`${error.code} : ${errorCategory}, ${errorName}`);
+  }
+
+  load(sourceUrl) {
+    this.shakaPlayer.load(sourceUrl).then(() => {
+      this.initShakaMenus();
+      // set up audio tracks
+      this.setupAudioTracks();
+      // set up text tracks
+      this.setupTextTracks();
+      // limit ABR by player size
+      this.resize();
+
+    }).catch(ShakaHandler.onError);
+  }
+
+  setupTextTracks() {
+    const player = this.player;
+    const shakaPlayer = this.shakaPlayer;
+
+    const textTracks = shakaPlayer.getVariantTracks()
+      .filter((track) => track.type === 'text');
+
+    // add the shaka player tracks to the video.js player
+    textTracks.forEach(function({
+      active,
+      language
+    }) {
+      player.addRemoteTextTrack({
+        default: active,
+        label: language,
+        language
+      }, true);
+    });
+
+    // sync the video.js track selection with the shaka player
+    const updateActiveShakaTrack = function() {
+      for (let { mode, language } of Array.from(player.textTracks())) {
+        if (mode === 'showing') {
+          shakaPlayer.setTextTrackVisibility(true);
+          shakaPlayer.configure({
+            preferredTextLanguage: language
+          });
 
           return;
         }
-
-        // Guarantee `value` is an array
-        if (!Array.isArray(value)) {
-          value = [value];
-        }
-
-        this.mediaPlayer_[key](...value);
-      });
-    }
-
-    this.mediaPlayer_.attachView(this.el_);
-
-    // Dash.js autoplays by default, video.js will handle autoplay
-    this.mediaPlayer_.setAutoPlay(false);
-
-    // Setup audio tracks
-    setupAudioTracks.call(null, this.player, tech);
-
-    // Setup text tracks
-    setupTextTracks.call(null, this.player, tech, options);
-
-    // Attach the source with any protection data
-    this.mediaPlayer_.setProtectionData(this.keySystemOptions_);
-    this.mediaPlayer_.attachSource(manifestSource);
-
-    this.tech_.triggerReady();
-  }
-
-  /*
-   * Iterate over the `keySystemOptions` array and convert each object into
-   * the type of object Dash.js expects in the `protData` argument.
-   *
-   * Also rename 'licenseUrl' property in the options to an 'serverURL' property
-   */
-  static buildDashJSProtData(keySystemOptions) {
-    let output = {};
-
-    if (!keySystemOptions || !Array.isArray(keySystemOptions)) {
-      return null;
-    }
-
-    for (let i = 0; i < keySystemOptions.length; i++) {
-      let keySystem = keySystemOptions[i];
-      let options = videojs.mergeOptions({}, keySystem.options);
-
-      if (options.licenseUrl) {
-        options.serverURL = options.licenseUrl;
-        delete options.licenseUrl;
       }
 
-      output[keySystem.name] = options;
+      // disable track display if no text tracks are enabled
+      shakaPlayer.setTextTrackVisibility(false);
+      shakaPlayer.configure({
+        preferredTextLanguage: ''
+      });
+    };
+
+    player.textTracks().on('change', updateActiveShakaTrack);
+    player.one('loadstart', () => {
+      player.textTracks().off('change', updateActiveShakaTrack);
+    });
+
+    // show the active default track
+    const showingTrack = textTracks.find((track) => track.active);
+    for (let track of Array.from(player.textTracks())) {
+      if (track.language === showingTrack.language) {
+        track.mode = 'showing';
+        break;
+      }
+    }
+  }
+
+  initShakaMenus() {
+    var player = this.player;
+    var shakaPlayer = this.shakaPlayer;
+
+    // player.options_['playbackRates'] = [];
+    var playerEL = player.el();
+    // return;
+    playerEL.className += ' vjs-shaka';
+// return;
+    var shakaButton = document.createElement('div');
+    shakaButton.setAttribute('class', 'vjs-shaka-button vjs-menu-button vjs-menu-button-popup vjs-control vjs-icon-cog');
+
+    var shakaMenu = document.createElement('div');
+    shakaMenu.setAttribute('class', 'vjs-menu');
+    shakaButton.appendChild(shakaMenu);
+
+    var shakaMenuContent = document.createElement('ul');
+    shakaMenuContent.setAttribute('class', 'vjs-menu-content');
+    shakaMenu.appendChild(shakaMenuContent);
+
+    var videoTracks = shakaPlayer.getVariantTracks();
+
+    // var el = document.createElement('li');
+    // el.setAttribute('class', 'vjs-menu-item vjs-selected');
+    // var label = document.createElement('span');
+    var setInnerText = this.setInnerText;
+
+    // setInnerText(label, "Auto");
+    // el.appendChild(label);
+    // el.addEventListener('click', function() {
+    //   var selected = shakaMenuContent.querySelector('.vjs-selected');
+    //   if (selected) {
+    //     selected.className = selected.className.replace('vjs-selected', '')
+    //   }
+    //   this.className = this.className + " vjs-selected";
+    //   shakaPlayer.configure({abr: {enabled: true}});
+    // });
+    // shakaMenuContent.appendChild(el);
+
+    for (var i = 0; i < videoTracks.length; ++i) {
+      if (videoTracks[i].videoCodec) {
+        (function() {
+          var track = videoTracks[i];
+          var rate = (videoTracks[i].bandwidth / 1024).toFixed(0);
+          var height = videoTracks[i].height;
+          var el = document.createElement('li');
+          el.setAttribute('class', 'vjs-menu-item');
+          el.setAttribute('data-val', rate);
+          el.setAttribute('data-id', track.id);
+          var label = document.createElement('span');
+          setInnerText(label, height + "p (" + rate + "k)");
+          el.appendChild(label);
+          el.addEventListener('click', function() {
+            var selected = shakaMenuContent.querySelector('.vjs-selected');
+            if (selected) {
+              selected.className = selected.className.replace('vjs-selected', '')
+            }
+            this.className = this.className + " vjs-selected";
+            shakaPlayer.configure({
+              abr: { enabled: false },
+              restrictions: {
+                minVideoBandwidth: 0,
+                maxVideoBandwidth: Infinity,
+                maxHeight: Infinity
+              }
+            });
+            shakaPlayer.selectVariantTrack(track, false);
+            console.log(track);
+            // TODO: Make opt_clearBuffer a property of this tech
+            // If above is set to true, you may wish to uncomment the below
+            // player.trigger('waiting');
+          })
+          shakaMenuContent.appendChild(el);
+        }())
+      }
+    }
+    var controlBar = playerEL.parentNode.querySelector('.vjs-control-bar');
+
+    if (controlBar) {
+      controlBar.insertBefore(shakaButton, controlBar.lastChild);
+    }
+  }
+
+  setupAudioTracks() {
+    const player = this.player;
+    const shakaPlayer = this.shakaPlayer;
+
+    const audioTracks = shakaPlayer.getVariantTracks()
+      .filter((track) => track.type === 'audio');
+
+    const activeLanguage = audioTracks
+      .reduce((active, track) => track.active ? track.language : active, '');
+
+    const languages = audioTracks.reduce(function(list, track) {
+      return list.indexOf(track.language) === -1 ?
+        list.concat([track.language]) : list;
+    }, []);
+
+    const vjsAudioTracks = player.audioTracks();
+    languages.forEach(function(language, i) {
+      const active = language === activeLanguage;
+      vjsAudioTracks.addTrack(
+        new videojs.AudioTrack({
+          enabled: active,
+          id: i + '',
+          kind: active ? 'main' : 'alternative',
+          label: language,
+          language: language
+        })
+      );
+    });
+
+    vjsAudioTracks.addEventListener('change', function() {
+      for (let i = 0; i < vjsAudioTracks.length; i++) {
+        const track = vjsAudioTracks[i];
+
+        if (track.enabled) {
+          shakaPlayer.configure({
+            preferredAudioLanguage: track.language
+          });
+
+          // Stop looping
+          break;
+        }
+      }
+    });
+  }
+
+  /**
+   * Creates a list of renditions that limits the range of the dash.js ABR algorithm
+   */
+  setupRepresentations() {
+    const player = this.player;
+    const shakaPlayer = this.shakaPlayer;
+
+    /**
+     * Creates a representation object that can be used as a quality level
+     */
+    const createRepresentation = function({ id, width, height, bandwidth }, enabledCallback) {
+      const representation = {
+        id: id + '',
+        width,
+        height,
+        bandwidth,
+        isEnabled_: true,
+        enabled: function(enable) {
+          if (enable === undefined) {
+            return representation.isEnabled_;
+          }
+
+          if (enable === representation.isEnabled_) {
+            return;
+          }
+
+          if (enable === true || enable === false) {
+            representation.isEnabled_ = enable;
+            enabledCallback();
+          }
+        }
+      };
+
+      return representation;
+    };
+
+    let representations = [];
+
+    const updateBitrateRange = function() {
+      const enabledRepresentations = representations
+        .filter((representation) => representation.enabled());
+
+      // disable the bitrate range limit if it's unecessary
+      // or if nothing's enabled
+      if (enabledRepresentations.length === representations.length ||
+        enabledRepresentations.length === 0) {
+        shakaPlayer.configure({
+          restrictions: {
+            minVideoBandwidth: 0,
+            maxVideoBandwidth: Infinity,
+            maxHeight: player.currentDimensions().height
+          }
+        });
+
+        return;
+      }
+
+      enabledRepresentations.sort((x, y) => x.bandwidth - y.bandwidth);
+
+      const min = enabledRepresentations[0].bandwidth;
+      const max = enabledRepresentations[enabledRepresentations.length - 1].bandwidth;
+
+      shakaPlayer.configure({
+        restrictions: {
+          minVideoBandwidth: min,
+          maxVideoBandwidth: max,
+          maxHeight: Infinity
+        }
+      });
+    };
+
+    return function() {
+      // populate the list on the first representations() call
+      representations = representations.length ? representations : shakaPlayer
+        .getVariantTracks()
+        .filter(({
+          type
+        }) => type === 'video')
+        .map((track) => createRepresentation(track, updateBitrateRange));
+
+      return representations;
+    };
+  }
+
+  setInnerText(element, text) {
+    if (typeof element === 'undefined') {
+      return false;
+    }
+    var textProperty = ('innerText' in element) ? 'innerText' : 'textContent';
+    try {
+      element[textProperty] = text;
+    } catch (anException) {
+      element.setAttribute('innerText', text);
+    }
+  }
+
+  resize() {
+    const player = this.player;
+    const shakaPlayer = this.shakaPlayer;
+    const hasDisabledRepresentations = player.dash &&
+      player.dash.representations &&
+      player.dash.representations()
+      .filter((rep) => !rep.enabled())
+      .length;
+
+    // representations have been manually set
+    // ignore the player size
+    if (hasDisabledRepresentations) {
+      return;
     }
 
-    return output;
+    if (document.fullscreenElement) {
+      // remove player size limit
+      shakaPlayer.configure({
+        restrictions: {
+          minVideoBandwidth: 0,
+          maxVideoBandwidth: Infinity,
+          maxHeight: Infinity
+        }
+      });
+
+      return;
+    }
+
+    shakaPlayer.configure({
+      restrictions: {
+        minVideoBandwidth: 0,
+        maxVideoBandwidth: Infinity,
+        maxHeight: Infinity
+      }
+    });
   }
 
   dispose() {
-    if (this.mediaPlayer_) {
-      this.mediaPlayer_.reset();
-    }
-
-    if (this.player.dash) {
-      delete this.player.dash;
-    }
+    player.off(['fullscreenchange'], () => { this.resize() });
   }
 
   duration() {
     const duration = this.el_.duration;
-    if (duration === Number.MAX_VALUE) {
+
+    if (duration === Number.MAX_VALUE ||
+      (this.shakaPlayer && this.shakaPlayer.isLive())) {
       return Infinity;
     }
+
     return duration;
   }
 
   /**
-   * Get a list of hooks for a specific lifecycle
-   *
-   * @param {string} type the lifecycle to get hooks from
-   * @param {Function=|Function[]=} hook Optionally add a hook tothe lifecycle
-   * @return {Array} an array of hooks or epty if none
-   * @method hooks
-   */
+    * Get a list of hooks for a specific lifecycle
+    *
+    * @param {string} type the lifecycle to get hooks from
+    * @param {Function=|Function[]=} hook Optionally add a hook tothe lifecycle
+    * @return {Array} an array of hooks or epty if none
+    * @method hooks
+    */
   static hooks(type, hook) {
-    Html5DashJS.hooks_[type] = Html5DashJS.hooks_[type] || [];
+    ShakaHandler.hooks_[type] = ShakaHandler.hooks_[type] || [];
 
     if (hook) {
-      Html5DashJS.hooks_[type] = Html5DashJS.hooks_[type].concat(hook);
+      ShakaHandler.hooks_[type] = ShakaHandler.hooks_[type].concat(hook);
     }
 
-    return Html5DashJS.hooks_[type];
-  }
-
-/**
- * Add a function hook to a specific dash lifecycle
- *
- * @param {string} type the lifecycle to hook the function to
- * @param {Function|Function[]} hook the function or array of functions to attach
- * @method hook
- */
-  static hook(type, hook) {
-    Html5DashJS.hooks(type, hook);
+    return ShakaHandler.hooks_[type];
   }
 
   /**
-   * Remove a hook from a specific dash lifecycle.
-   *
-   * @param {string} type the lifecycle that the function hooked to
-   * @param {Function} hook The hooked function to remove
-   * @return {boolean} True if the function was removed, false if not found
-   * @method removeHook
-   */
+    * Add a function hook to a specific dash lifecycle
+    *
+    * @param {string} type the lifecycle to hook the function to
+    * @param {Function|Function[]} hook the function or array of functions to attach
+    * @method hook
+    */
+  static hook(type, hook) {
+    ShakaHandler.hooks(type, hook);
+  }
+
+  /**
+    * Remove a hook from a specific dash lifecycle.
+    *
+    * @param {string} type the lifecycle that the function hooked to
+    * @param {Function} hook The hooked function to remove
+    * @return {boolean} True if the function was removed, false if not found
+    * @method removeHook
+    */
   static removeHook(type, hook) {
-    const index = Html5DashJS.hooks(type).indexOf(hook);
+    const index = ShakaHandler.hooks(type).indexOf(hook);
 
     if (index === -1) {
       return false;
     }
 
-    Html5DashJS.hooks_[type] = Html5DashJS.hooks_[type].slice();
-    Html5DashJS.hooks_[type].splice(index, 1);
+    ShakaHandler.hooks_[type] = ShakaHandler.hooks_[type].slice();
+    ShakaHandler.hooks_[type].splice(index, 1);
 
     return true;
   }
 }
 
-Html5DashJS.hooks_ = {};
+ShakaHandler.hooks_ = {};
 
 const canHandleKeySystems = function(source) {
   // copy the source
   source = JSON.parse(JSON.stringify(source));
 
-  if (Html5DashJS.updateSourceData) {
+  if (ShakaHandler.updateSourceData) {
     videojs.log.warn('updateSourceData has been deprecated.' +
       ' Please switch to using hook("updatesource", callback).');
-    source = Html5DashJS.updateSourceData(source);
+    source = ShakaHandler.updateSourceData(source);
   }
 
   // call updatesource hooks
-  Html5DashJS.hooks('updatesource').forEach((hook) => {
+  ShakaHandler.hooks('updatesource').forEach((hook) => {
     source = hook(source);
   });
 
-  let videoEl = document.createElement('video');
+  const videoEl = document.createElement('video');
   if (source.keySystemOptions &&
     !(navigator.requestMediaKeySystemAccess ||
       // IE11 Win 8.1
@@ -248,15 +521,13 @@ const canHandleKeySystems = function(source) {
 videojs.DashSourceHandler = function() {
   return {
     canHandleSource: function(source) {
-      let dashExtRE = /\.mpd/i;
-
       if (!canHandleKeySystems(source)) {
         return '';
       }
 
       if (videojs.DashSourceHandler.canPlayType(source.type)) {
         return 'probably';
-      } else if (dashExtRE.test(source.src)) {
+      } else if ((/\.mpd/i).test(source.src)) {
         return 'maybe';
       } else {
         return '';
@@ -264,7 +535,7 @@ videojs.DashSourceHandler = function() {
     },
 
     handleSource: function(source, tech, options) {
-      return new Html5DashJS(source, tech, options);
+      return new ShakaHandler(source, tech, options);
     },
 
     canPlayType: function(type) {
@@ -274,6 +545,7 @@ videojs.DashSourceHandler = function() {
 };
 
 videojs.DashSourceHandler.canPlayType = function(type) {
+  // return 'probably';
   let dashTypeRE = /^application\/dash\+xml/i;
   if (dashTypeRE.test(type)) {
     return 'probably';
@@ -287,5 +559,5 @@ if (!!window.MediaSource) {
   videojs.getTech('Html5').registerSourceHandler(videojs.DashSourceHandler(), 0);
 }
 
-videojs.Html5DashJS = Html5DashJS;
-export default Html5DashJS;
+videojs.ShakaHandler = ShakaHandler;
+export default ShakaHandler;
